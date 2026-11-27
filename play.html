@@ -1,0 +1,103 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
+<title>춘스토리 퀴즈 - 참가</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div class="wrap" id="app"></div>
+
+<script type="module">
+import { db, ref, get, set, push, update, onValue, serverTimestamp, CHOICES, esc } from "./firebase.js";
+
+const app = document.getElementById("app");
+let pin = null, me = null, myName = "", room = null;
+
+function store(k, v) { try { sessionStorage.setItem(k, v); } catch {} }
+function load(k) { try { return sessionStorage.getItem(k); } catch { return null; } }
+
+// ── 1. PIN과 별명 입력 ──
+function showJoin(msg = "") {
+  app.innerHTML = `
+    <div class="center"><h1>춘스토리 퀴즈</h1></div>
+    <div class="card">
+      <input id="pin" inputmode="numeric" maxlength="4" placeholder="PIN 번호 4자리" value="${esc(load("pin") || "")}">
+      <input id="name" maxlength="12" placeholder="별명 (실명 말고 별명!)">
+      <button class="btn-main" id="go">입장</button>
+      <p style="color:#e21b3c;font-weight:bold">${esc(msg)}</p>
+    </div>`;
+  document.getElementById("go").onclick = join;
+}
+
+async function join() {
+  const p = document.getElementById("pin").value.trim();
+  const n = document.getElementById("name").value.trim();
+  if (!/^\d{4}$/.test(p)) return showJoin("PIN은 숫자 4자리예요.");
+  if (!n) return showJoin("별명을 입력하세요.");
+  const st = await get(ref(db, `rooms/${p}/state`));
+  if (!st.exists()) return showJoin("그 PIN의 방이 없어요. 번호를 확인하세요.");
+  if (st.val() === "end") return showJoin("이미 끝난 퀴즈예요.");
+  const r = push(ref(db, `rooms/${p}/players`));
+  await set(r, { name: n, score: 0, last: 0 });
+  pin = p; me = r.key; myName = n;
+  store("pin", p); store("me", me); store("name", n);
+  listen();
+}
+
+function listen() {
+  onValue(ref(db, `rooms/${pin}`), snap => { room = snap.val(); render(); });
+}
+
+function myScore() { return room?.players?.[me]?.score || 0; }
+function myRank() {
+  const ps = Object.entries(room?.players || {}).sort((a, b) => (b[1].score || 0) - (a[1].score || 0));
+  return ps.findIndex(([id]) => id === me) + 1;
+}
+
+function render() {
+  if (!room) return showJoin("방이 사라졌어요.");
+  const head = `<div class="topbar"><span>${esc(myName)}</span><span>${myScore()}점</span></div>`;
+  if (room.state === "lobby") {
+    app.innerHTML = head + `<div class="center result"><p class="big">입장 완료!</p><p>화면에 내 별명이 보이나요?<br>선생님이 시작할 때까지 기다려요.</p></div>`;
+  } else if (room.state === "question") {
+    const i = room.qIndex, q = room.questions[i];
+    const mine = room.answers?.[i]?.[me];
+    if (mine) {
+      app.innerHTML = head + `<div class="center result"><p class="big">제출 완료</p><p>다른 친구들을 기다리는 중...</p></div>`;
+      return;
+    }
+    app.innerHTML = head + `
+      <p class="center" style="font-weight:bold">${i + 1}번. ${esc(q.q)}</p>
+      <div class="pad">${q.options.map((o, k) => `
+        <button data-k="${k}" style="background:${CHOICES[k].color}"><span class="shape">${CHOICES[k].shape}</span>${esc(o)}</button>`).join("")}</div>`;
+    app.querySelectorAll(".pad button").forEach(b => b.onclick = () => answer(i, +b.dataset.k));
+  } else if (room.state === "reveal") {
+    const i = room.qIndex, mine = room.answers?.[i]?.[me];
+    const right = mine && mine.choice === room.correct;
+    const last = room.players?.[me]?.last || 0;
+    app.innerHTML = head + `
+      <div class="center result ${right ? "ok" : "no"}">
+        <p class="big">${right ? "정답! ✔" : mine ? "아쉬워요 ✘" : "시간 초과 ⏰"}</p>
+        <p style="font-size:1.4rem">+${last}점</p>
+        <p>지금 ${myRank()}등</p>
+      </div>`;
+  } else if (room.state === "end") {
+    app.innerHTML = head + `<div class="center result"><p class="big">최종 ${myRank()}등</p><p style="font-size:1.4rem">${myScore()}점</p><p>수고했어요!</p></div>`;
+  }
+}
+
+async function answer(i, k) {
+  app.querySelectorAll(".pad button").forEach(b => b.disabled = true);
+  await set(ref(db, `rooms/${pin}/answers/${i}/${me}`), { choice: k, at: serverTimestamp() });
+}
+
+// 새로고침해도 같은 방으로 돌아오기
+if (load("pin") && load("me")) {
+  pin = load("pin"); me = load("me"); myName = load("name") || "";
+  get(ref(db, `rooms/${pin}/players/${me}`)).then(s => s.exists() ? listen() : showJoin());
+} else showJoin();
+</script>
+</body>
+</html>

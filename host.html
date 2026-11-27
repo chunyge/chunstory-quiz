@@ -1,0 +1,193 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>춘스토리 퀴즈 - 선생님 화면</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div class="wrap" id="app"></div>
+
+<script type="module">
+import { db, ref, set, get, update, onValue, serverTimestamp, CHOICES, esc } from "./firebase.js";
+
+// 기본 문항: 한 줄에 한 문제  →  문제 | 보기1 | 보기2 | 보기3 | 보기4 | 정답번호(1~4)
+const DEFAULT_QUESTIONS = `고려를 세운 인물은? | 견훤 | 궁예 | 왕건 | 이성계 | 3
+노비안검법을 실시하여 호족 세력을 약화시킨 왕은? | 태조 | 광종 | 성종 | 공민왕 | 2
+최승로가 시무 28조를 올린 왕은? | 광종 | 현종 | 성종 | 문종 | 3
+거란의 1차 침입 때 외교 담판으로 강동 6주를 얻은 인물은? | 서희 | 강감찬 | 윤관 | 최영 | 1
+거란의 3차 침입 때 귀주 대첩을 이끈 장수는? | 을지문덕 | 서희 | 김윤후 | 강감찬 | 4
+윤관이 별무반을 이끌고 여진을 정벌한 뒤 쌓은 것은? | 천리장성 | 동북 9성 | 강동 6주 | 4군 6진 | 2
+최충헌이 설치한 최씨 무신 정권의 최고 권력 기구는? | 교정도감 | 도병마사 | 중방 | 정방 | 1
+몽골의 침입을 부처의 힘으로 물리치고자 만든 것은? | 초조대장경 | 직지심체요절 | 팔만대장경 | 삼국사기 | 3
+현재 남아 있는 세계에서 가장 오래된 금속 활자본은? | 상정고금예문 | 팔만대장경 | 삼국유사 | 직지심체요절 | 4
+반원 개혁을 추진하며 쌍성총관부를 되찾은 왕은? | 충렬왕 | 공민왕 | 우왕 | 광종 | 2`;
+
+const LIMIT_SEC = 20;
+const app = document.getElementById("app");
+let pin = null, room = null, quiz = [], timerId = null, revealing = false;
+const startLocalByQ = {};
+
+function parseQuestions(text) {
+  const out = [];
+  text.split("\n").map(l => l.trim()).filter(Boolean).forEach((line, i) => {
+    const p = line.split("|").map(s => s.trim());
+    if (p.length !== 6) throw new Error(`${i + 1}번째 줄: '|'로 나눈 칸이 6개여야 해요 (문제, 보기 4개, 정답번호).`);
+    const a = parseInt(p[5], 10);
+    if (!(a >= 1 && a <= 4)) throw new Error(`${i + 1}번째 줄: 정답번호는 1~4 중 하나여야 해요.`);
+    out.push({ q: p[0], options: p.slice(1, 5), answer: a - 1 });
+  });
+  if (!out.length) throw new Error("문제가 하나도 없어요.");
+  return out;
+}
+
+// ── 1. 문제 확인/수정 화면 ──
+function showSetup() {
+  let saved = DEFAULT_QUESTIONS;
+  try { saved = localStorage.getItem("quizText") || DEFAULT_QUESTIONS; } catch {}
+  app.innerHTML = `
+    <h1 class="center">퀴즈 준비</h1>
+    <div class="card" style="max-width:900px">
+      <p><b>한 줄에 한 문제</b>씩 적어요: <code>문제 | 보기1 | 보기2 | 보기3 | 보기4 | 정답번호</code></p>
+      <textarea id="qtext">${esc(saved)}</textarea>
+      <div class="row" style="justify-content:space-between">
+        <button id="reset" style="background:#888">기본 문제로 되돌리기</button>
+        <button id="make" class="btn-main" style="width:auto">방 만들기 ▶</button>
+      </div>
+      <p id="err" style="color:#e21b3c;font-weight:bold"></p>
+    </div>`;
+  document.getElementById("reset").onclick = () => { document.getElementById("qtext").value = DEFAULT_QUESTIONS; };
+  document.getElementById("make").onclick = async () => {
+    const text = document.getElementById("qtext").value;
+    try { quiz = parseQuestions(text); } catch (e) { document.getElementById("err").textContent = e.message; return; }
+    try { localStorage.setItem("quizText", text); } catch {}
+    await createRoom();
+  };
+}
+
+// ── 2. 방 만들기 ──
+async function createRoom() {
+  for (let i = 0; i < 20; i++) {
+    const p = String(Math.floor(1000 + Math.random() * 9000));
+    const snap = await get(ref(db, `rooms/${p}/state`));
+    if (!snap.exists()) { pin = p; break; }
+  }
+  // 학생에게는 문제와 보기만 보내고, 정답은 공개할 때만 보냄
+  await set(ref(db, `rooms/${pin}`), {
+    state: "lobby", qIndex: -1, total: quiz.length, limit: LIMIT_SEC, created: serverTimestamp(),
+    questions: quiz.map(x => ({ q: x.q, options: x.options }))
+  });
+  onValue(ref(db, `rooms/${pin}`), snap => { room = snap.val(); render(); });
+}
+
+function playersSorted() {
+  const ps = room?.players ? Object.entries(room.players).map(([id, p]) => ({ id, ...p })) : [];
+  return ps.sort((a, b) => (b.score || 0) - (a.score || 0));
+}
+
+function render() {
+  if (!room) return;
+  if (room.state === "lobby") return renderLobby();
+  if (room.state === "question") return renderQuestion();
+  if (room.state === "reveal") return renderReveal();
+  if (room.state === "end") return renderEnd();
+}
+
+function renderLobby() {
+  const ps = playersSorted();
+  const url = location.href.replace(/host\.html.*$/, "play.html");
+  app.innerHTML = `
+    <div class="center">
+      <p class="big">${esc(url)}</p>
+      <p>위 주소로 들어와서 PIN을 입력하세요</p>
+      <div class="pin">${pin}</div>
+      <h2>참가자 ${ps.length}명</h2>
+      <div class="players">${ps.map(p => `<span class="chip">${esc(p.name)}</span>`).join("")}</div>
+      <button class="btn-main" style="width:auto" id="start" ${ps.length ? "" : "disabled"}>시작하기 ▶</button>
+    </div>`;
+  document.getElementById("start").onclick = () => startQuestion(0);
+}
+
+async function startQuestion(i) {
+  revealing = false;
+  await update(ref(db, `rooms/${pin}`), { state: "question", qIndex: i, qStart: serverTimestamp(), correct: null });
+}
+
+function renderQuestion() {
+  const i = room.qIndex, q = room.questions[i];
+  const answered = room.answers?.[i] ? Object.keys(room.answers[i]).length : 0;
+  const total = room.players ? Object.keys(room.players).length : 0;
+  app.innerHTML = `
+    <div class="topbar"><span>${i + 1} / ${room.total}</span><div class="timer" id="t">${LIMIT_SEC}</div><span>답한 학생 ${answered} / ${total}</span></div>
+    <div class="question">${esc(q.q)}</div>
+    <div class="choices">${q.options.map((o, k) => `
+      <div class="choice" style="background:${CHOICES[k].color}"><span class="shape">${CHOICES[k].shape}</span>${esc(o)}</div>`).join("")}</div>
+    <p class="center"><button id="skip" style="background:#888;font-size:1rem">바로 정답 공개</button></p>`;
+  document.getElementById("skip").onclick = reveal;
+  clearInterval(timerId);
+  if (startLocalByQ[i] === undefined) startLocalByQ[i] = Date.now();
+  const startLocal = startLocalByQ[i];
+  const tick = () => {
+    const left = Math.max(0, LIMIT_SEC - Math.floor((Date.now() - startLocal) / 1000));
+    const el = document.getElementById("t"); if (el) el.textContent = left;
+    if (left <= 0) reveal();
+  };
+  tick(); timerId = setInterval(tick, 250);
+  if (total > 0 && answered >= total) reveal();
+}
+
+// 정답 공개 + 점수 계산 (빨리 맞힐수록 높은 점수: 500~1000점)
+async function reveal() {
+  if (revealing || room.state !== "question") return;
+  revealing = true; clearInterval(timerId);
+  const i = room.qIndex, ans = quiz[i].answer;
+  const answers = room.answers?.[i] || {};
+  const upd = { state: "reveal", correct: ans };
+  for (const [pid, a] of Object.entries(answers)) {
+    const p = room.players?.[pid]; if (!p) continue;
+    let pts = 0;
+    if (a.choice === ans) {
+      const ms = Math.max(0, (a.at || 0) - (room.qStart || 0));
+      pts = Math.round(500 + 500 * Math.max(0, 1 - ms / (LIMIT_SEC * 1000)));
+    }
+    upd[`players/${pid}/score`] = (p.score || 0) + pts;
+    upd[`players/${pid}/last`] = pts;
+  }
+  for (const pid of Object.keys(room.players || {})) if (!answers[pid]) upd[`players/${pid}/last`] = 0;
+  await update(ref(db, `rooms/${pin}`), upd);
+}
+
+function renderReveal() {
+  const i = room.qIndex, q = room.questions[i], ans = room.correct;
+  const answers = Object.values(room.answers?.[i] || {});
+  const counts = [0, 1, 2, 3].map(k => answers.filter(a => a.choice === k).length);
+  const max = Math.max(1, ...counts);
+  const top = playersSorted().slice(0, 5);
+  const last = i + 1 >= room.total;
+  app.innerHTML = `
+    <div class="topbar"><span>${i + 1} / ${room.total}</span><span></span></div>
+    <div class="question">${esc(q.q)}</div>
+    <div class="bar">${counts.map((c, k) => `<div style="background:${CHOICES[k].color};height:${20 + 150 * c / max}px;${k === ans ? "" : "opacity:.35"}">${c}</div>`).join("")}</div>
+    <div class="choices">${q.options.map((o, k) => `
+      <div class="choice ${k === ans ? "correct" : "dim"}" style="background:${CHOICES[k].color}"><span class="shape">${k === ans ? "✔" : CHOICES[k].shape}</span>${esc(o)}</div>`).join("")}</div>
+    <h2 class="center">순위</h2>
+    <div class="rank">${top.map((p, r) => `<div class="item"><span>${r + 1}. ${esc(p.name)}</span><span>${p.score || 0}</span></div>`).join("")}</div>
+    <p class="center"><button class="btn-main" style="width:auto" id="next">${last ? "최종 결과 ▶" : "다음 문제 ▶"}</button></p>`;
+  document.getElementById("next").onclick = () => last ? update(ref(db, `rooms/${pin}`), { state: "end" }) : startQuestion(i + 1);
+}
+
+function renderEnd() {
+  const ps = playersSorted();
+  const medal = ["🥇", "🥈", "🥉"];
+  app.innerHTML = `
+    <h1 class="center">최종 순위</h1>
+    <div class="rank">${ps.map((p, r) => `<div class="item"><span>${medal[r] || (r + 1) + "."} ${esc(p.name)}</span><span>${p.score || 0}</span></div>`).join("")}</div>
+    <p class="center"><button class="btn-blue" id="again">새 퀴즈 만들기</button></p>`;
+  document.getElementById("again").onclick = () => location.reload();
+}
+
+showSetup();
+</script>
+</body>
+</html>
